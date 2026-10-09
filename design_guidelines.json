@@ -1,0 +1,45 @@
+{
+  "app_name": "Expense Claim Policy Review Assistant",
+  "archetype": "ARCHETYPE 4: SWISS & HIGH-CONTRAST (Authority, Clarity, Truth) combined with ARCHETYPE 1: ORGANIC & EARTHY accents",
+  "theme": "Light theme with high contrast slate/obsidian typography and terracotta/moss highlights",
+  "typography": {
+    "headings": {
+      "font_family": "Plus Jakarta Sans, sans-serif",
+      "weights": ["600", "700"],
+      "letter_spacing": "tracking-tight"
+    },
+    "body": {
+      "font_family": "Inter, sans-serif",
+      "weights": ["400", "500"]
+    },
+    "mono": {
+      "font_family": "JetBrains Mono, monospace"
+    }
+  },
+  "colors": {
+    "primary": "#0F172A",
+    "secondary": "#334155",
+    "accent": "#0D9488",
+    "destructive": "#E11D48",
+    "warning": "#D97706",
+    "success": "#059669",
+    "background": "#F8FAFC",
+    "card": "#FFFFFF",
+    "border": "#E2E8F0"
+  },
+  "visual_enhancers": {
+    "border_radius": "rounded-lg",
+    "shadows": ["shadow-sm", "shadow-md"],
+    "glassmorphism": "backdrop-blur-xl bg-white/80 border border-slate-200/60"
+  },
+  "component_path": "/app/frontend/src/components",
+  "instructions_to_main_agent": "Build a robust fullstack expense claim policy review assistant with Python backend, SQLite, deterministic validation + Claude Sonnet 5.5 AI classification with Emergent LLM key placeholder, registration/login, claim submission with line items & receipts, AI policy citations, reviewer approvals/rejections, audit logs, policy configuration, and comprehensive test suite.",
+  "image_urls": [],
+  "UNIVERSAL GUIDELINES FOR MAIN AGENT": [
+    "You must ensure all interactive elements have data-testid attributes.",
+    "Do not use transparent backgrounds without blur or solid contrast.",
+    "Ensure all text meets APCA contrast standards.",
+    "Use clean, professional design with generous spacing (p-6, p-8) and strict grid hierarchy.",
+    "Ensure both frontend (React + Tailwind) and backend (FastAPI + SQLite) are fully operational."
+  ]
+}

@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: expense-claim-policy-api
+    env: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SQLITE_PATH
+        value: /data/expense_claims.db
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PASSWORD_SALT
+        generateValue: true
+      - key: CORS_ORIGINS
+        sync: false
+      - key: EMERGENT_LLM_KEY
+        sync: false
+    disk:
+      name: expense-claims-data
+      mountPath: /data
+      sizeGB: 1
