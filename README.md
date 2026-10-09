@@ -27,10 +27,16 @@ Copy-Item backend\.env.example backend\.env
 SQLite initializes automatically at first API start. Supported currencies are USD, EUR, GBP, CAD, and AUD.
 
 ## AI workflow and policy evidence
-The app selects a stored policy category, sends the claim plus that policy and validation context to Claude, and stores the analysis. Every citation is copied from a stored rule. If the model fails, the fallback has low confidence and cannot automatically approve the claim. Configure `EMERGENT_LLM_KEY` only on the backend.
+The app selects a stored policy category, sends the claim plus that policy and validation context to Claude, and stores the analysis. Every citation is copied from a stored rule. If the model fails, the fallback has low confidence and cannot automatically approve the claim. Configure `EMERGENT_LLM_KEY` only on the backend. The health endpoint reports the active mode (`LIVE AI` or `DEMO MODE`).
+
+## Policy admin and import
+Reviewers can edit the organizational policy from the **Policy admin** page without redeploying:
+- Add, edit, and delete rules (code, title, text, category, claim limit).
+- Export the current rule set as JSON, then re-import after edits.
+- Import JSON or CSV. Columns required per row: `code,title,text,category,limit_amount`. Rules are **upserted by rule code** so existing codes update in place and new codes are created. Imports are transactional — a single invalid row aborts the whole apply, and `Preview` runs a dry-run without changes. Every change is written to the audit history (`policy:create`/`update`/`delete`/`import`).
 
 ## Tests
-From the project root: `pytest backend/test_server.py -q`. Tests cover required fields, future dates, positive amounts, missing receipts, limits, AI fallback labelling, review actions, and persistent history.
+From the project root: `pytest backend/test_server.py -q`. The 13 offline tests cover required fields, future dates, positive amounts, duplicate detection, missing receipts, limits, AI fallback labelling, review actions, dashboard totals, persistent history, policy CRUD, and JSON/CSV import (apply and dry-run).
 
 ## Deployment
 `render.yaml` is a beginner-friendly blueprint. Create a Web Service, set backend environment variables in the provider dashboard, set the frontend `REACT_APP_BACKEND_URL` to the backend URL before building, and use a persistent disk for `SQLITE_PATH` (for example `/data/expense_claims.db`). Verify `/api/health` and register a test reviewer.
