@@ -19,6 +19,7 @@ def test_future_date_validation():
  else: assert False
 def test_missing_receipt_and_limit():
  c=ClaimIn(claimant="A Person",claim_date=date.today(),category="Meals",amount=800,currency="USD",description="team meal purpose",receipt_available=False); codes=[x["code"] for x in deterministic(c)["findings"]]; assert "RECEIPT-MISSING" in codes and "LIMIT-EXCEEDED" in codes
+ c=ClaimIn(claimant="A Person",claim_date=date.today(),category="Meals",amount=76,currency="USD",description="team meal purpose",receipt_available=True); assert "LIMIT-EXCEEDED" in [x["code"] for x in deterministic(c)["findings"]]
 def test_claim_persists_history_and_demo_ai():
  r=client.post("/api/claims",headers=h(),json={"claimant":"A Person","claim_date":str(date.today()),"category":"Other","amount":25,"currency":"USD","description":"misc business item","receipt_available":True}); assert r.status_code==200; assert r.json()["ai"]["mode"] in ("DEMO MODE","DEMO FALLBACK")
  assert client.get("/api/history",headers=h()).json()

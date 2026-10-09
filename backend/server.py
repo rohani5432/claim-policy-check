@@ -16,7 +16,7 @@ JWT_SECRET=os.getenv("JWT_SECRET","local-development-secret-change-me"); securit
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s"); logger=logging.getLogger("expense-review")
 POLICY=[
  {"code":"TRAVEL-01","title":"Travel and accommodation","text":"Flights, trains, lodging, and ground transport are eligible when tied to business travel. Lodging is capped at 250 USD per night; economy airfare is required unless a documented exception is approved.","category":"Travel","limit":2500},
- {"code":"MEALS-01","title":"Business meals","text":"Business meals are eligible up to 75 USD per person and must list the business purpose and attendees. Alcohol is not reimbursable.","category":"Meals","limit":600},
+ {"code":"MEALS-01","title":"Business meals","text":"Business meals are eligible up to 75 USD per claim and must list the business purpose and attendees. Alcohol is not reimbursable.","category":"Meals","limit":75},
  {"code":"OFFICE-01","title":"Office supplies","text":"Reasonable office supplies are eligible up to 300 USD per claim. Personal items and equipment purchases require pre-approval.","category":"Office Supplies","limit":300},
  {"code":"TECH-01","title":"Software and technology","text":"Software subscriptions and technology expenses require manager approval and are limited to 1000 USD per claim.","category":"Technology","limit":1000},
  {"code":"OTHER-01","title":"Other expenses","text":"Expenses outside listed categories require a clear business purpose and human review before approval.","category":"Other","limit":500},]
@@ -25,7 +25,9 @@ def db():
 def init_db():
  with db() as c:
   c.executescript("""CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'reviewer',created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS claims(id INTEGER PRIMARY KEY,claimant TEXT NOT NULL,claim_date TEXT NOT NULL,category TEXT NOT NULL,amount REAL NOT NULL,currency TEXT NOT NULL,description TEXT NOT NULL,receipt_available INTEGER NOT NULL,status TEXT NOT NULL,validation_json TEXT NOT NULL,ai_json TEXT NOT NULL,created_by INTEGER NOT NULL,created_at TEXT NOT NULL,FOREIGN KEY(created_by) REFERENCES users(id)); CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY,claim_id INTEGER NOT NULL,action TEXT NOT NULL,reason TEXT,actor_id INTEGER NOT NULL,created_at TEXT NOT NULL,FOREIGN KEY(claim_id) REFERENCES claims(id),FOREIGN KEY(actor_id) REFERENCES users(id)); CREATE TABLE IF NOT EXISTS policy(code TEXT PRIMARY KEY,title TEXT NOT NULL,text TEXT NOT NULL,category TEXT NOT NULL,limit_amount REAL NOT NULL);""")
-  for p in POLICY: c.execute("INSERT OR IGNORE INTO policy VALUES(?,?,?,?,?)",(p["code"],p["title"],p["text"],p["category"],p["limit"]))
+  for p in POLICY:
+   c.execute("INSERT OR IGNORE INTO policy VALUES(?,?,?,?,?)",(p["code"],p["title"],p["text"],p["category"],p["limit"]))
+   c.execute("UPDATE policy SET title=?,text=?,category=?,limit_amount=? WHERE code=?",(p["title"],p["text"],p["category"],p["limit"],p["code"]))
 def now(): return datetime.now(timezone.utc).isoformat()
 def password_hash(v): return hashlib.sha256((v+os.getenv("PASSWORD_SALT","expense-review-salt")).encode()).hexdigest()
 def token_for(u): return jwt.encode({"sub":str(u["id"]),"email":u["email"],"role":u["role"],"exp":datetime.now(timezone.utc)+timedelta(hours=12)},JWT_SECRET,algorithm="HS256")
