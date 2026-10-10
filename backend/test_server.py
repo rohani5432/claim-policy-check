@@ -20,6 +20,13 @@ from server import app, init_db, deterministic, ClaimIn  # noqa: E402
 init_db()
 client = TestClient(app)
 
+# Pre-register the admin so the first-user-admin rule is deterministic.
+_admin = client.post("/api/auth/register", json={
+    "name": "Admin User", "email": "admin@example.com", "password": "password123",
+}).json()
+ADMIN_H = {"Authorization": f"Bearer {_admin['token']}"}
+assert _admin["user"]["role"] == "admin"
+
 
 def _token(email: str = "test@example.com", password: str = "password123") -> str:
     r = client.post("/api/auth/register", json={"name": "Test Reviewer", "email": email, "password": password})
@@ -156,27 +163,52 @@ def test_dashboard_totals_grow():
 # Policy CRUD + import
 # ---------------------------------------------------------------------------
 def test_policy_crud_round_trip():
-    headers = _h("policy@example.com")
-    rules = client.get("/api/policy", headers=headers).json()
+    rules = client.get("/api/policy", headers=ADMIN_H).json()
     assert any(r["code"] == "MEALS-01" and r["limit_amount"] == 75 for r in rules)
 
-    created = client.post("/api/policy", headers=headers, json={
+    created = client.post("/api/policy", headers=ADMIN_H, json={
         "code": "NEW-RULE-01", "title": "New rule", "text": "A new policy rule for testing imports.",
         "category": "Other", "limit_amount": 50,
     })
     assert created.status_code == 200
 
-    updated = client.put("/api/policy/NEW-RULE-01", headers=headers, json={
+    updated = client.put("/api/policy/NEW-RULE-01", headers=ADMIN_H, json={
         "title": "New rule", "text": "Updated text for testing.", "category": "Other", "limit_amount": 60,
     })
     assert updated.status_code == 200 and updated.json()["limit_amount"] == 60
 
-    deleted = client.delete("/api/policy/NEW-RULE-01", headers=headers)
+    deleted = client.delete("/api/policy/NEW-RULE-01", headers=ADMIN_H)
     assert deleted.status_code == 200
 
 
+def test_non_admin_cannot_edit_policy():
+    # The first registered user in this test module became admin; a brand new
+    # account registered now will be a plain reviewer.
+    headers = _h("reviewer-only@example.com")
+    assert client.get("/api/policy", headers=headers).status_code == 200  # read is fine
+    r = client.post("/api/policy", headers=headers, json={
+        "code": "DENY-01", "title": "Denied", "text": "Should be rejected for non-admin.",
+        "category": "Other", "limit_amount": 10,
+    })
+    assert r.status_code == 403
+    assert client.delete("/api/policy/MEALS-01", headers=headers).status_code == 403
+
+
+def test_csv_export_includes_submitted_claim():
+    headers = _h("export@example.com")
+    client.post("/api/claims", headers=headers, json={
+        "claimant": "Export Person", "claim_date": str(date.today()), "category": "Office Supplies",
+        "amount": 15, "currency": "USD", "description": "pens and markers for workshop",
+        "receipt_available": True,
+    })
+    r = client.get("/api/export/claims.csv", headers=headers)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/csv")
+    assert "Export Person" in r.text
+    assert "ai_mode" in r.text  # header row
+
+
 def test_policy_import_json_upserts_by_code():
-    headers = _h("import@example.com")
     payload = (
         '[{"code":"MEALS-01","title":"Business meals","text":"Business meals are '
         'eligible up to 75 USD per claim and must list the business purpose and attendees. '
@@ -185,19 +217,18 @@ def test_policy_import_json_upserts_by_code():
     )
     r = client.post(
         "/api/policy/import",
-        headers=headers,
+        headers=ADMIN_H,
         files={"file": ("rules.json", io.BytesIO(payload.encode()), "application/json")},
         data={"apply": "true"},
     )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["errors"] == [] and body["applied"] == 2
-    codes = {p["code"] for p in client.get("/api/policy", headers=headers).json()}
+    codes = {p["code"] for p in client.get("/api/policy", headers=ADMIN_H).json()}
     assert "IMPORT-TEST" in codes
 
 
 def test_policy_import_csv_dry_run_and_errors():
-    headers = _h("import2@example.com")
     csv_text = (
         "code,title,text,category,limit_amount\n"
         "CSV-OK,Imported CSV,This is a safe imported CSV rule,Other,42\n"
@@ -205,7 +236,7 @@ def test_policy_import_csv_dry_run_and_errors():
     )
     r = client.post(
         "/api/policy/import",
-        headers=headers,
+        headers=ADMIN_H,
         files={"file": ("rules.csv", io.BytesIO(csv_text.encode()), "text/csv")},
         data={"apply": "true"},
     )

@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -19,13 +20,18 @@ import re
 import secrets
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
+from html import escape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, List, Optional
+from urllib.parse import urlparse
 
+import httpx
 import jwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
@@ -36,6 +42,13 @@ DB_PATH = Path(os.getenv("SQLITE_PATH", str(ROOT / "expense_claims.db")))
 JWT_SECRET = os.getenv("JWT_SECRET", "local-development-secret-change-me")
 PASSWORD_SALT = os.getenv("PASSWORD_SALT", "expense-review-salt")
 SUPPORTED_CURRENCIES = ("USD", "EUR", "GBP", "CAD", "AUD")
+DAILY_LIVE_AI_LIMIT = int(os.getenv("DAILY_LIVE_AI_LIMIT", "50"))
+
+# Resend (Emergent-managed email) — constants per playbook
+EMAIL_BASE_URL = "https://integrations.emergentagent.com"
+EMAIL_KEY = os.getenv("EMERGENT_EMAIL_KEY", "")
+EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "Expense Control")
+EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("expense-review")
@@ -89,6 +102,7 @@ def init_db() -> None:
                 description TEXT NOT NULL, receipt_available INTEGER NOT NULL,
                 status TEXT NOT NULL, validation_json TEXT NOT NULL, ai_json TEXT NOT NULL,
                 created_by INTEGER NOT NULL, created_at TEXT NOT NULL,
+                claimant_email TEXT,
                 FOREIGN KEY(created_by) REFERENCES users(id));
             CREATE TABLE IF NOT EXISTS history(
                 id INTEGER PRIMARY KEY, claim_id INTEGER, action TEXT NOT NULL,
@@ -104,6 +118,9 @@ def init_db() -> None:
         cols = {r[1] for r in c.execute("PRAGMA table_info(policy)").fetchall()}
         if "updated_at" not in cols:
             c.execute("ALTER TABLE policy ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+        claim_cols = {r[1] for r in c.execute("PRAGMA table_info(claims)").fetchall()}
+        if "claimant_email" not in claim_cols:
+            c.execute("ALTER TABLE claims ADD COLUMN claimant_email TEXT")
         # claim_id in history may be NOT NULL in older DBs — allow NULL for policy audits.
         hist_cols = c.execute("PRAGMA table_info(history)").fetchall()
         claim_id_col = next((r for r in hist_cols if r[1] == "claim_id"), None)
@@ -154,6 +171,12 @@ def auth_user(creds: HTTPAuthorizationCredentials = Depends(security)) -> dict:
         raise HTTPException(401, "Your session is invalid or expired")
 
 
+def admin_user(user: dict = Depends(auth_user)) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin access is required for policy changes")
+    return user
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -170,6 +193,7 @@ class LoginIn(BaseModel):
 
 class ClaimIn(BaseModel):
     claimant: str = Field(min_length=2, max_length=120)
+    claimant_email: Optional[EmailStr] = None
     claim_date: date
     category: str = Field(min_length=2, max_length=50)
     amount: float = Field(gt=0, le=1_000_000)
@@ -294,9 +318,15 @@ def _demo_result(rule: dict, validation: dict, mode: str, reason: str) -> dict:
     }
 
 
-async def ai_review(claim: ClaimIn, rule: dict, validation: dict) -> dict:
+async def ai_review(claim: ClaimIn, rule: dict, validation: dict, allow_live: bool = True) -> dict:
     """Return structured AI analysis. Never fabricate citations; cite the resolved rule only."""
     key = os.getenv("EMERGENT_LLM_KEY", "").strip()
+    if not allow_live:
+        logger.info("ai_review mode=DEMO reason=daily_cap claim_category=%s", rule["category"])
+        return _demo_result(
+            rule, validation, "DEMO MODE",
+            "Daily live-AI submission cap reached for this reviewer. Deterministic analysis is authoritative.",
+        )
     if not key or key.lower().startswith("your_"):
         logger.info("ai_review mode=DEMO reason=no_key claim_category=%s", rule["category"])
         return _demo_result(
@@ -407,15 +437,18 @@ def health() -> dict:
 @app.post("/api/auth/register")
 def register(data: RegisterIn) -> dict:
     with db() as c:
+        # First registered user becomes admin; subsequent users are reviewers.
+        existing = c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+        role = "admin" if existing == 0 else "reviewer"
         try:
             cur = c.execute(
-                "INSERT INTO users(name,email,password_hash,created_at) VALUES(?,?,?,?)",
-                (data.name, data.email.lower(), password_hash(data.password), now()),
+                "INSERT INTO users(name,email,password_hash,role,created_at) VALUES(?,?,?,?,?)",
+                (data.name, data.email.lower(), password_hash(data.password), role, now()),
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "An account with this email already exists")
-        u = {"id": cur.lastrowid, "name": data.name, "email": data.email.lower(), "role": "reviewer"}
-    logger.info("user registered id=%s", u["id"])
+        u = {"id": cur.lastrowid, "name": data.name, "email": data.email.lower(), "role": role}
+    logger.info("user registered id=%s role=%s", u["id"], u["role"])
     return {"token": token_for(u), "user": u}
 
 
@@ -441,15 +474,24 @@ def me(user: dict = Depends(auth_user)) -> dict:
 async def create_claim(data: ClaimIn, user: dict = Depends(auth_user)) -> dict:
     validation = deterministic(data)
     rule = resolve_category(data.category, data.description, load_policy_rows())
-    ai = await ai_review(data, rule, validation)
+    # Spend guardrail: cap daily LIVE AI submissions per reviewer.
+    today = date.today().isoformat()
+    with db() as c:
+        used = c.execute(
+            "SELECT COUNT(*) AS n FROM claims WHERE created_by=? AND substr(created_at,1,10)=? "
+            "AND json_extract(ai_json,'$.mode')='LIVE AI'",
+            (user["id"], today),
+        ).fetchone()["n"]
+    allow_live = used < DAILY_LIVE_AI_LIMIT
+    ai = await ai_review(data, rule, validation, allow_live=allow_live)
     needs_human = (not validation["valid"]) or ai.get("uncertain") or ai["decision"] == "Needs Human Review"
     status = "Needs Human Review" if needs_human else "Pending Review"
     with db() as c:
         cur = c.execute(
-            "INSERT INTO claims(claimant,claim_date,category,amount,currency,description,receipt_available,status,validation_json,ai_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO claims(claimant,claim_date,category,amount,currency,description,receipt_available,status,validation_json,ai_json,created_by,created_at,claimant_email) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (data.claimant, data.claim_date.isoformat(), rule["category"], data.amount, data.currency,
              data.description, int(data.receipt_available), status, json.dumps(validation), json.dumps(ai),
-             user["id"], now()),
+             user["id"], now(), (data.claimant_email or None)),
         )
         cid = cur.lastrowid
         c.execute(
@@ -485,7 +527,7 @@ def get_claim(claim_id: int, user: dict = Depends(auth_user)) -> dict:
 
 
 @app.post("/api/claims/{claim_id}/action")
-def action(claim_id: int, data: ActionIn, user: dict = Depends(auth_user)) -> dict:
+async def action(claim_id: int, data: ActionIn, user: dict = Depends(auth_user)) -> dict:
     if data.action in ("reject", "override") and len(data.reason.strip()) < 5:
         raise HTTPException(422, "A reason is required for this action")
     labels = {"approve": "Approved", "reject": "Rejected",
@@ -502,7 +544,11 @@ def action(claim_id: int, data: ActionIn, user: dict = Depends(auth_user)) -> di
             (claim_id, data.action, data.reason, user["id"], now()),
         )
     logger.info("claim action id=%s action=%s actor=%s", claim_id, data.action, user["id"])
-    return {"status": status, "claim_id": claim_id}
+
+    email_result = {"sent": False, "reason": "not_requested"}
+    if data.action == "clarification":
+        email_result = await _send_clarification_email(dict(row), data.reason, user["name"])
+    return {"status": status, "claim_id": claim_id, "email": email_result}
 
 
 @app.get("/api/history")
@@ -539,7 +585,7 @@ def _policy_audit(actor_id: int, code: str, action: str) -> None:
 
 
 @app.post("/api/policy")
-def policy_create(data: PolicyIn, user: dict = Depends(auth_user)) -> dict:
+def policy_create(data: PolicyIn, user: dict = Depends(admin_user)) -> dict:
     with db() as c:
         try:
             c.execute(
@@ -554,7 +600,7 @@ def policy_create(data: PolicyIn, user: dict = Depends(auth_user)) -> dict:
 
 
 @app.put("/api/policy/{code}")
-def policy_update(code: str, data: PolicyUpdateIn, user: dict = Depends(auth_user)) -> dict:
+def policy_update(code: str, data: PolicyUpdateIn, user: dict = Depends(admin_user)) -> dict:
     with db() as c:
         row = c.execute("SELECT code FROM policy WHERE code=?", (code,)).fetchone()
         if not row:
@@ -569,7 +615,7 @@ def policy_update(code: str, data: PolicyUpdateIn, user: dict = Depends(auth_use
 
 
 @app.delete("/api/policy/{code}")
-def policy_delete(code: str, user: dict = Depends(auth_user)) -> dict:
+def policy_delete(code: str, user: dict = Depends(admin_user)) -> dict:
     with db() as c:
         cur = c.execute("DELETE FROM policy WHERE code=?", (code,))
         if cur.rowcount == 0:
@@ -597,7 +643,7 @@ def _parse_import_rows(content: bytes, filename: str) -> List[dict]:
 
 
 @app.post("/api/policy/import")
-async def policy_import(file: UploadFile = File(...), apply: str = Form("true"), user: dict = Depends(auth_user)) -> dict:
+async def policy_import(file: UploadFile = File(...), apply: str = Form("true"), user: dict = Depends(admin_user)) -> dict:
     """Upsert policy rules by code from a JSON or CSV upload.
 
     Required fields per row: code, title, text, category, limit_amount.
@@ -647,3 +693,160 @@ async def policy_import(file: UploadFile = File(...), apply: str = Form("true"),
         "dry_run": not do_apply or bool(errors),
         "preview": valid[:50],
     }
+
+
+# ---------------------------------------------------------------------------
+# Email (Resend via Emergent-managed integration)
+# ---------------------------------------------------------------------------
+_SHORTENERS = ("bit.ly", "tinyurl.com", "t.co", "is.gd", "cutt.ly", "goo.gl", "rebrand.ly")
+_CRED_ASK = ("reply with your password", "reply with the code", "send your password", "cvv",
+             "send us your password", "enter your password below", "confirm your card number",
+             "your full card number", "seed phrase", "recovery phrase", "verify your card",
+             "social security number", "confirm your bank details")
+_HOSTISH = re.compile(r"\b(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})", re.I)
+
+
+def _host_ok(host: str) -> bool:
+    if not host or "xn--" in host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    return not any(host == s or host.endswith("." + s) for s in _SHORTENERS)
+
+
+def _same_site(shown: str, real: str) -> bool:
+    return shown == real or real.endswith("." + shown) or shown.endswith("." + real)
+
+
+class _EmailScan(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tags, self.urls, self.anchors = set(), [], []
+        self._href, self._text = None, []
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.add(tag.lower())
+        self.urls += [v for k, v in attrs if k.lower() in ("href", "src") and v]
+        if tag.lower() == "a":
+            self._href = dict((k.lower(), v) for k, v in attrs).get("href")
+            self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "a" and self._href is not None:
+            self.anchors.append((self._href, "".join(self._text)))
+            self._href, self._text = None, []
+
+
+def _assert_safe_email(subject: str, html: str) -> None:
+    scan = _EmailScan(); scan.feed(html)
+    if scan.tags & {"form", "input", "textarea", "select"}:
+        raise ValueError("No forms or input fields in email (G2)")
+    body = f"{subject}\n{html}".lower()
+    for p in _CRED_ASK:
+        if p in body:
+            raise ValueError(f"Email asks the recipient for credentials: {p!r} (G2)")
+    for url in scan.urls:
+        low = url.strip().lower()
+        if low.startswith(("mailto:", "tel:", "cid:", "#")):
+            continue
+        if not low.startswith("https://"):
+            raise ValueError(f"Email links/assets must be absolute https: {url!r} (G3)")
+        host = urlparse(low).hostname or ""
+        if not _host_ok(host) or urlparse(low).username is not None:
+            raise ValueError(f"Shortened, numeric-host or credential-bearing URL: {url!r} (G3)")
+    for href, text in scan.anchors:
+        real = urlparse(href.strip().lower()).hostname or ""
+        if not real:
+            continue
+        for m in _HOSTISH.finditer(text):
+            if not _same_site(m.group(1).lower(), real):
+                raise ValueError(f"Anchor text {m.group(1)!r} != real link host {real!r} (G3)")
+
+
+async def _send_email(to: str, subject: str, html: str) -> Optional[str]:
+    if not EMAIL_KEY or EMAIL_KEY.lower().startswith("your_"):
+        logger.info("email disabled: no EMERGENT_EMAIL_KEY configured")
+        return None
+    _assert_safe_email(subject, html)
+    payload = {"to": [to], "subject": subject, "html": html, "from_name": EMAIL_FROM_NAME}
+    if EMAIL_REPLY_TO:
+        payload["contact_email"] = EMAIL_REPLY_TO
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{EMAIL_BASE_URL}/api/v1/email/send",
+                headers={"X-Email-Key": EMAIL_KEY}, json=payload,
+            )
+        resp.raise_for_status()
+        return resp.json().get("id")
+    except Exception as exc:
+        logger.warning("email send failed: %s", type(exc).__name__)
+        return None
+
+
+async def _send_clarification_email(claim: dict, reason: str, reviewer_name: str) -> dict:
+    """Server-side template; the reviewer never supplies HTML (G4)."""
+    to = (claim.get("claimant_email") or "").strip()
+    if not to:
+        return {"sent": False, "reason": "no_claimant_email"}
+    subject = f"{EMAIL_FROM_NAME}: clarification needed on claim #{claim['id']}"
+    note = escape(reason.strip() or "Please provide additional context so we can finish the review.")
+    html = (
+        '<table role="presentation" width="100%"><tr><td style="padding:24px;'
+        'font-family:Arial,sans-serif;color:#16211f">'
+        f'<p>Hi {escape(claim.get("claimant") or "there")},</p>'
+        f'<p>{escape(reviewer_name)} has requested clarification on your expense claim '
+        f'<strong>#{escape(str(claim["id"]))}</strong> ({escape(str(claim.get("amount", "")))} '
+        f'{escape(claim.get("currency",""))}, {escape(claim.get("category",""))}).</p>'
+        f'<p><em>Note from reviewer:</em> {note}</p>'
+        '<p>Please reply to this email with the requested details so the reviewer can finish the decision.</p>'
+        f'<p style="font-size:12px;color:#6d7b78">Sent by {escape(EMAIL_FROM_NAME)}. '
+        'We never ask for your password or card details by email.</p></td></tr></table>'
+    )
+    email_id = await _send_email(to, subject, html)
+    return {"sent": bool(email_id), "reason": "ok" if email_id else "send_failed", "id": email_id}
+
+
+# ---------------------------------------------------------------------------
+# CSV export of claims (same filters as /api/claims)
+# ---------------------------------------------------------------------------
+@app.get("/api/export/claims.csv")
+def claims_export(status: Optional[str] = None, search: Optional[str] = None, user: dict = Depends(auth_user)):
+    q = "SELECT * FROM claims WHERE 1=1"
+    args: list[Any] = []
+    if status:
+        q += " AND status=?"; args.append(status)
+    if search:
+        q += " AND (lower(claimant) LIKE ? OR lower(description) LIKE ?)"
+        args += [f"%{search.lower()}%"] * 2
+    with db() as c:
+        rows = c.execute(q + " ORDER BY created_at DESC", args).fetchall()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "claimant", "claimant_email", "claim_date", "category", "amount", "currency",
+                "receipt_available", "status", "ai_mode", "ai_decision", "policy_code",
+                "created_by", "created_at", "description"])
+    for r in rows:
+        d = dict(r)
+        val = json.loads(d.get("validation_json") or "{}")
+        ai = json.loads(d.get("ai_json") or "{}")
+        w.writerow([d["id"], d["claimant"], d.get("claimant_email") or "", d["claim_date"],
+                    d["category"], f"{d['amount']:.2f}", d["currency"],
+                    "yes" if d["receipt_available"] else "no", d["status"],
+                    ai.get("mode", ""), ai.get("decision", ""), val.get("policy_code", ""),
+                    d["created_by"], d["created_at"], d["description"]])
+    filename = f"claims-{date.today().isoformat()}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
